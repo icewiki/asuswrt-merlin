@@ -16,30 +16,11 @@ NS(test_main)(void *arg)
 {
   (void)arg;
 
-  uint32_t ttl_mid = MIN_DNS_TTL / 2 + MAX_DNS_TTL / 2;
+  uint32_t ttl_mid = MIN_DNS_TTL_AT_EXIT / 2 + MAX_DNS_TTL_AT_EXIT / 2;
 
-  tt_int_op(dns_clip_ttl(MIN_DNS_TTL - 1),==,MIN_DNS_TTL);
-  tt_int_op(dns_clip_ttl(ttl_mid),==,ttl_mid);
-  tt_int_op(dns_clip_ttl(MAX_DNS_TTL + 1),==,MAX_DNS_TTL);
-
-  done:
-  return;
-}
-
-#undef NS_SUBMODULE
-
-#define NS_SUBMODULE expiry_ttl
-
-static void
-NS(test_main)(void *arg)
-{
-  (void)arg;
-
-  uint32_t ttl_mid = MIN_DNS_TTL / 2 + MAX_DNS_ENTRY_AGE / 2;
-
-  tt_int_op(dns_get_expiry_ttl(MIN_DNS_TTL - 1),==,MIN_DNS_TTL);
-  tt_int_op(dns_get_expiry_ttl(ttl_mid),==,ttl_mid);
-  tt_int_op(dns_get_expiry_ttl(MAX_DNS_ENTRY_AGE + 1),==,MAX_DNS_ENTRY_AGE);
+  tt_int_op(dns_clip_ttl(MIN_DNS_TTL_AT_EXIT - 1),==,MIN_DNS_TTL_AT_EXIT);
+  tt_int_op(dns_clip_ttl(ttl_mid),==,MAX_DNS_TTL_AT_EXIT);
+  tt_int_op(dns_clip_ttl(MAX_DNS_TTL_AT_EXIT + 1),==,MAX_DNS_TTL_AT_EXIT);
 
   done:
   return;
@@ -52,7 +33,7 @@ NS(test_main)(void *arg)
 static int resolve_retval = 0;
 static int resolve_made_conn_pending = 0;
 static char *resolved_name = NULL;
-static cached_resolve_t *cache_entry = NULL;
+static cached_resolve_t *cache_entry_mock = NULL;
 
 static int n_fake_impl = 0;
 
@@ -85,8 +66,8 @@ NS(dns_resolve_impl)(edge_connection_t *exitconn, int is_resolve,
   if (hostname_out && resolved_name)
     *hostname_out = tor_strdup(resolved_name);
 
-  if (resolve_out && cache_entry)
-    *resolve_out = cache_entry;
+  if (resolve_out && cache_entry_mock)
+    *resolve_out = cache_entry_mock;
 
   n_fake_impl++;
 
@@ -213,7 +194,7 @@ NS(test_main)(void *arg)
 
   exitconn->on_circuit = &(on_circuit->base_);
 
-  cache_entry = fake_resolved;
+  cache_entry_mock = fake_resolved;
 
   prev_n_send_resolved_cell_replacement =
   n_send_resolved_cell_replacement;
@@ -749,7 +730,6 @@ NS(test_main)(void *arg)
 
 struct testcase_t dns_tests[] = {
    TEST_CASE(clip_ttl),
-   TEST_CASE(expiry_ttl),
    TEST_CASE(resolve),
    TEST_CASE_ASPECT(resolve_impl, addr_is_ip_no_need_to_resolve),
    TEST_CASE_ASPECT(resolve_impl, non_exit),

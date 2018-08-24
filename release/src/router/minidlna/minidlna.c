@@ -71,9 +71,13 @@
 
 #include <sys/stat.h>
 
+#ifdef MS_IPK
+#include <sys/stat.h>
+#else
 #ifdef RTAC68U
 #include <shared.h>
 #include <bcmnvram.h>
+#endif
 #endif
 
 #include "config.h"
@@ -97,10 +101,11 @@
 #include "process.h"
 #include "upnpevents.h"
 #include "scanner.h"
-#include "inotify.h"
+#include "monitor.h"
 #include "log.h"
 #include "tivo_beacon.h"
 #include "tivo_utils.h"
+#include "avahi.h"
 
 #if SQLITE_VERSION_NUMBER < 3005001
 # warning "Your SQLite3 library appears to be too old!  Please use 3.5.1 or newer."
@@ -141,7 +146,7 @@ OpenAndConfHTTPSocket(unsigned short port)
 		return -1;
 	}
 
-	if (listen(s, 6) < 0)
+	if (listen(s, 16) < 0)
 	{
 		DPRINTF(E_ERROR, L_GENERAL, "listen(http): %s\n", strerror(errno));
 		close(s);
@@ -266,6 +271,21 @@ getfriendlyname(char *buf, int len)
 }
 
 static int
+remove_files(char *path)
+{
+	char *p, cmd[PATH_MAX], buf[PATH_MAX];
+
+	for (p = buf; *path; path++) {
+		*p++ = '\\';
+		*p++ = *path;
+	}
+	*p = '\0';
+	snprintf(cmd, sizeof(cmd), "rm -rf %s/files.db %s/art_cache", buf, buf);
+
+	return ( system(cmd) != 0 ) ? 0 : 1;
+}
+
+static int
 open_db(sqlite3 **sq3)
 {
 	char path[PATH_MAX];
@@ -285,7 +305,8 @@ open_db(sqlite3 **sq3)
 	sql_exec(db, "pragma page_size = 4096");
 	sql_exec(db, "pragma journal_mode = OFF");
 	sql_exec(db, "pragma synchronous = OFF;");
-	sql_exec(db, "pragma default_cache_size = 8192;");
+	sql_exec(db, "pragma default_cache_size = 256;");
+
 
 	return new_db;
 }
@@ -294,12 +315,10 @@ static void
 check_db(sqlite3 *db, int new_db, pid_t *scanner_pid)
 {
 	struct media_dir_s *media_path = NULL;
-	char cmd[PATH_MAX*2];
 	char **result;
 	int i, rows = 0;
 	int ret;
 	int retry_times;
-	char *ptr, *shift;
 
 	if (!new_db)
 	{
@@ -353,16 +372,8 @@ rescan:
 		sqlite3_close(db);
 
 		retry_times = 0;
-
-		memset(db_path_spec, 0, 256);
-		for (ptr = db_path, shift = db_path_spec; *ptr; ++ptr, ++shift) {
-			if (strchr("()", *ptr))
-				*shift++ = '\\';
-			*shift = *ptr;
-		}
 retry:
-		snprintf(cmd, sizeof(cmd), "rm -rf %s/files.db %s/art_cache", db_path_spec, db_path_spec);
-		if (system(cmd) != 0) {
+		if (!remove_files(db_path)) {
 			if (retry_times++ < 2)
 				goto retry;
 
@@ -500,8 +511,11 @@ void create_scantag(void)
 	char path[PATH_MAX];
 	FILE *fp;
 
+#ifdef MS_IPK
+	snprintf(path, sizeof(path), "%s/scantag", "/tmp/Mediaserver");
+#else
 	snprintf(path, sizeof(path), "%s/scantag", db_path);
-
+#endif
 	fp=fopen(path, "w");
 
 	if(fp) fclose(fp);
@@ -510,8 +524,11 @@ void create_scantag(void)
 void remove_scantag(void)
 {
 	char path[PATH_MAX];
-
+#ifdef MS_IPK
+	snprintf(path, sizeof(path), "%s/scantag", "/tmp/Mediaserver");
+#else
 	snprintf(path, sizeof(path), "%s/scantag", db_path);
+#endif
 
 	unlink(path);
 }
@@ -530,6 +547,9 @@ init(int argc, char **argv)
 	int i;
 	int pid;
 	int debug_flag = 0;
+#ifdef MS_IPK
+	log_file = 0;
+#endif
 	int verbose_flag = 0;
 	int options_flag = 0;
 	struct sigaction sa;
@@ -545,7 +565,6 @@ init(int argc, char **argv)
 	int ifaces = 0;
 	media_types types;
 	uid_t uid = 0;
-	char *ptr, *shift;
 	int retry_times;
 
 	/* first check if "-f" option is used */
@@ -572,7 +591,11 @@ init(int argc, char **argv)
 	
 	runtime_vars.port = 8200;
 	runtime_vars.notify_interval = 895;	/* seconds between SSDP announces */
+#ifdef MS_IPK
+	runtime_vars.max_connections = 10;
+#else
 	runtime_vars.max_connections = 50;
+#endif
 	runtime_vars.root_container = NULL;
 	runtime_vars.ifaces[0] = NULL;
 
@@ -785,6 +808,10 @@ init(int argc, char **argv)
 			if (strtobool(ary_options[i].value))
 				SETFLAG(WIDE_LINKS_MASK);
 			break;
+		case TIVO_DISCOVERY:
+			if (strcasecmp(ary_options[i].value, "beacon") == 0)
+				CLEARFLAG(TIVO_BONJOUR_MASK);
+			break;
 		default:
 			DPRINTF(E_ERROR, L_GENERAL, "Unknown option in file %s\n",
 				optionsfile);
@@ -884,21 +911,16 @@ init(int argc, char **argv)
 		case 'h':
 			runtime_vars.port = -1; // triggers help display
 			break;
+		case 'W':
+			web_status = 1;
+			break;
 		case 'r':
 			rescan_db = 1;
 			break;
 		case 'R':
-			memset(db_path_spec, 0, 256);
-			for(ptr = db_path, shift = db_path_spec; *ptr; ++ptr, ++shift){
-				if(strchr("()", *ptr))
-					*shift++ = '\\';
-				*shift = *ptr;
-			}
-
-			snprintf(buf, sizeof(buf), "rm -rf %s/files.db %s/art_cache", db_path_spec, db_path_spec);
 			retry_times = 0;
 retry:
-			if (system(buf) != 0) {
+			if (!remove_files(db_path)) {
 				if (retry_times++ < 2)
 					goto retry;
 
@@ -932,6 +954,12 @@ retry:
 			printf("Version " MINIDLNA_VERSION "\n");
 			exit(0);
 			break;
+#ifdef MS_IPK
+		case 'D':
+			printf("Log file will be created in %s\n", log_path);
+			log_file = 1;
+			break;
+#endif
 		default:
 			DPRINTF(E_ERROR, L_GENERAL, "Unknown option: %s\n", argv[i]);
 			runtime_vars.port = -1; // triggers help display
@@ -1000,6 +1028,9 @@ retry:
 		path = buf;
 		#endif
 	}
+#ifdef MS_IPK
+	if (log_file == 1)
+#endif
 	log_init(path, log_level);
 
 	if (process_check_if_running(pidfilename) < 0)
@@ -1051,15 +1082,24 @@ retry:
 	if (!children)
 	{
 		DPRINTF(E_ERROR, L_GENERAL, "Allocation failed\n");
+		// remove working flag
+		remove_scantag();
+#ifdef MS_IPK
+		unlink("/tmp/count");
+#endif
 		return 1;
 	}
 
 	// remove working flag
 	remove_scantag();
+#ifdef MS_IPK
+	unlink("/tmp/count");
+#endif
 
 	return 0;
 }
 
+#ifndef MS_IPK
 #if (!defined(RTN66U) && !defined(RTN56U))
 #define PATH_ICON_PNG_SM	"/rom/dlna/icon_sm.png"
 #define PATH_ICON_PNG_LRG	"/rom/dlna/icon_lrg.png"
@@ -1184,6 +1224,7 @@ RETURN:
 	return ret;
 }
 #endif
+#endif
 
 #define NOTIFY_INTERVAL	3
 
@@ -1215,15 +1256,21 @@ main(int argc, char **argv)
 
 	for (i = 0; i < L_MAX; i++)
 		log_level[i] = E_WARN;
+	init_nls();
+
+#ifdef MS_IPK
+	if (access("/tmp/Mediaserver/scantag",0) == 0)
+		remove_scantag();
+#endif
 
 	ret = init(argc, argv);
 	if (ret != 0)
 		return 1;
-	init_nls();
 
+#ifndef MS_IPK
 #if (!defined(RTN66U) && !defined(RTN56U))
 #ifdef RTAC68U
-	if (!strcmp(get_productid(), "RT-AC66U V2")) {
+	if (is_ac66u_v2_series()) {
 		init_icon(PATH_ICON_ALT_PNG_SM);
 		init_icon(PATH_ICON_ALT_PNG_LRG);
 		init_icon(PATH_ICON_ALT_JPEG_SM);
@@ -1237,6 +1284,7 @@ main(int argc, char **argv)
 		init_icon(PATH_ICON_JPEG_SM);
 		init_icon(PATH_ICON_JPEG_LRG);
 	}
+#endif
 #endif
 
 	DPRINTF(E_WARN, L_GENERAL, "Starting " SERVER_NAME " version " MINIDLNA_VERSION ".\n");
@@ -1289,14 +1337,21 @@ main(int argc, char **argv)
 		ret = sqlite3_create_function(db, "tivorandom", 1, SQLITE_UTF8, NULL, &TiVoRandomSeedFunc, NULL, NULL);
 		if (ret != SQLITE_OK)
 			DPRINTF(E_ERROR, L_TIVO, "ERROR: Failed to add sqlite randomize function for TiVo!\n");
-		/* open socket for sending Tivo notifications */
-		sbeacon = OpenAndConfTivoBeaconSocket();
-		if(sbeacon < 0)
-			DPRINTF(E_FATAL, L_GENERAL, "Failed to open sockets for sending Tivo beacon notify "
-				"messages. EXITING\n");
-		tivo_bcast.sin_family = AF_INET;
-		tivo_bcast.sin_addr.s_addr = htonl(getBcastAddress());
-		tivo_bcast.sin_port = htons(2190);
+		if (GETFLAG(TIVO_BONJOUR_MASK))
+		{
+			tivo_bonjour_register();
+		}
+		else
+		{
+			/* open socket for sending Tivo notifications */
+			sbeacon = OpenAndConfTivoBeaconSocket();
+			if(sbeacon < 0)
+				DPRINTF(E_FATAL, L_GENERAL, "Failed to open sockets for sending Tivo beacon notify "
+					"messages. EXITING\n");
+			tivo_bcast.sin_family = AF_INET;
+			tivo_bcast.sin_addr.s_addr = htonl(getBcastAddress());
+			tivo_bcast.sin_port = htons(2190);
+		}
 	}
 #endif
 

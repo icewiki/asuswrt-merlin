@@ -14,6 +14,9 @@ then
     exit 1
 fi
 
+# Generate static key for tls-auth (or static key mode)
+$(dirname ${0})/../../src/openvpn/openvpn --genkey --secret ta.key
+
 # Create required directories and files
 mkdir -p sample-ca
 rm -f sample-ca/index.txt
@@ -57,6 +60,22 @@ openssl ca -batch -config openssl.cnf \
     -out sample-ca/client-revoked.crt -in sample-ca/client-revoked.csr
 openssl ca -config openssl.cnf -revoke sample-ca/client-revoked.crt
 openssl ca -config openssl.cnf -gencrl -out sample-ca/ca.crl
+
+# Create DSA server and client cert (signed by 'regular' RSA CA)
+openssl dsaparam -out sample-ca/dsaparams.pem 2048
+
+openssl req -new -newkey dsa:sample-ca/dsaparams.pem -nodes -config openssl.cnf \
+    -extensions server \
+    -keyout sample-ca/server-dsa.key -out sample-ca/server-dsa.csr \
+    -subj "/C=KG/ST=NA/O=OpenVPN-TEST/CN=Test-Server-DSA/emailAddress=me@myhost.mydomain"
+openssl ca -batch -config openssl.cnf -extensions server \
+    -out sample-ca/server-dsa.crt -in sample-ca/server-dsa.csr
+
+openssl req -new -newkey dsa:sample-ca/dsaparams.pem -nodes -config openssl.cnf \
+    -keyout sample-ca/client-dsa.key -out sample-ca/client-dsa.csr \
+    -subj "/C=KG/ST=NA/O=OpenVPN-TEST/CN=Test-Client-DSA/emailAddress=me@myhost.mydomain"
+openssl ca -batch -config openssl.cnf \
+    -out sample-ca/client-dsa.crt -in sample-ca/client-dsa.csr
 
 # Create EC server and client cert (signed by 'regular' RSA CA)
 openssl ecparam -out sample-ca/secp256k1.pem -name secp256k1

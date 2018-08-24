@@ -9,6 +9,42 @@
  * This is implemented as a wrapper around Adam Langley's eventdns.c code.
  * (We can't just use gethostbyname() and friends because we really need to
  * be nonblocking.)
+ *
+ * There are three main cases when a Tor relay uses dns.c to launch a DNS
+ * request:
+ *   <ol>
+ *    <li>To check whether the DNS server is working more or less correctly.
+ *      This happens via dns_launch_correctness_checks().  The answer is
+ *      reported in the return value from later calls to
+ *      dns_seems_to_be_broken().
+ *    <li>When a client has asked the relay, in a RELAY_BEGIN cell, to connect
+ *      to a given server by hostname.  This happens via dns_resolve().
+ *    <li>When a client has asked the rela, in a RELAY_RESOLVE cell, to look
+ *      up a given server's IP address(es) by hostname. This also happens via
+ *      dns_resolve().
+ *   </ol>
+ *
+ * Each of these gets handled a little differently.
+ *
+ * To check for correctness, we look up some hostname we expect to exist and
+ * have real entries, some hostnames which we expect to definitely not exist,
+ * and some hostnames that we expect to probably not exist.  If too many of
+ * the hostnames that shouldn't exist do exist, that's a DNS hijacking
+ * attempt.  If too many of the hostnames that should exist have the same
+ * addresses as the ones that shouldn't exist, that's a very bad DNS hijacking
+ * attempt, or a very naughty captive portal.  And if the hostnames that
+ * should exist simply don't exist, we probably have a broken nameserver.
+ *
+ * To handle client requests, we first check our cache for answers. If there
+ * isn't something up-to-date, we've got to launch A or AAAA requests as
+ * appropriate.  How we handle responses to those in particular is a bit
+ * complex; see dns_lookup() and set_exitconn_info_from_resolve().
+ *
+ * When a lookup is finally complete, the inform_pending_connections()
+ * function will tell all of the streams that have been waiting for the
+ * resolve, by calling connection_exit_connect() if the client sent a
+ * RELAY_BEGIN cell, and by calling send_resolved_cell() or
+ * send_hostname_cell() if the client sent a RELAY_RESOLVE cell.
  **/
 
 #define DNS_PRIVATE
@@ -27,61 +63,8 @@
 #include "router.h"
 #include "ht.h"
 #include "sandbox.h"
-#ifdef HAVE_EVENT2_DNS_H
 #include <event2/event.h>
 #include <event2/dns.h>
-#else
-#include <event.h>
-#include "eventdns.h"
-#ifndef HAVE_EVDNS_SET_DEFAULT_OUTGOING_BIND_ADDRESS
-#define HAVE_EVDNS_SET_DEFAULT_OUTGOING_BIND_ADDRESS
-#endif
-#endif
-
-#ifndef HAVE_EVENT2_DNS_H
-struct evdns_base;
-struct evdns_request;
-#define evdns_base_new(x,y) tor_malloc(1)
-#define evdns_base_clear_nameservers_and_suspend(base) \
-  evdns_clear_nameservers_and_suspend()
-#define evdns_base_search_clear(base) evdns_search_clear()
-#define evdns_base_set_default_outgoing_bind_address(base, a, len)  \
-  evdns_set_default_outgoing_bind_address((a),(len))
-#define evdns_base_resolv_conf_parse(base, options, fname) \
-  evdns_resolv_conf_parse((options), (fname))
-#define evdns_base_count_nameservers(base)      \
-  evdns_count_nameservers()
-#define evdns_base_resume(base)                 \
-  evdns_resume()
-#define evdns_base_config_windows_nameservers(base)     \
-  evdns_config_windows_nameservers()
-#define evdns_base_set_option_(base, opt, val) \
-  evdns_set_option((opt),(val),DNS_OPTIONS_ALL)
-/* Note: our internal eventdns.c, plus Libevent 1.4, used a 1 return to
- * signify failure to launch a resolve. Libevent 2.0 uses a -1 return to
- * signify a failure on a resolve, though if we're on Libevent 2.0, we should
- * have event2/dns.h and never hit these macros.  Regardless, 0 is success. */
-#define evdns_base_resolve_ipv4(base, addr, options, cb, ptr) \
-  ((evdns_resolve_ipv4((addr), (options), (cb), (ptr))!=0)    \
-   ? NULL : ((void*)1))
-#define evdns_base_resolve_ipv6(base, addr, options, cb, ptr) \
-  ((evdns_resolve_ipv6((addr), (options), (cb), (ptr))!=0)    \
-   ? NULL : ((void*)1))
-#define evdns_base_resolve_reverse(base, addr, options, cb, ptr)        \
-  ((evdns_resolve_reverse((addr), (options), (cb), (ptr))!=0)           \
-   ? NULL : ((void*)1))
-#define evdns_base_resolve_reverse_ipv6(base, addr, options, cb, ptr)   \
-  ((evdns_resolve_reverse_ipv6((addr), (options), (cb), (ptr))!=0)      \
-   ? NULL : ((void*)1))
-
-#elif defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER < 0x02000303
-#define evdns_base_set_option_(base, opt, val) \
-  evdns_base_set_option((base), (opt),(val),DNS_OPTIONS_ALL)
-
-#else
-#define evdns_base_set_option_ evdns_base_set_option
-
-#endif
 
 /** How long will we wait for an answer from the resolver before we decide
  * that the resolver is wedged? */
@@ -260,29 +243,19 @@ has_dns_init_failed(void)
 }
 
 /** Helper: Given a TTL from a DNS response, determine what TTL to give the
- * OP that asked us to resolve it. */
+ * OP that asked us to resolve it, and how long to cache that record
+ * ourselves. */
 uint32_t
 dns_clip_ttl(uint32_t ttl)
 {
-  if (ttl < MIN_DNS_TTL)
-    return MIN_DNS_TTL;
-  else if (ttl > MAX_DNS_TTL)
-    return MAX_DNS_TTL;
+  /* This logic is a defense against "DefectTor" DNS-based traffic
+   * confirmation attacks, as in https://nymity.ch/tor-dns/tor-dns.pdf .
+   * We only give two values: a "low" value and a "high" value.
+   */
+  if (ttl < MIN_DNS_TTL_AT_EXIT)
+    return MIN_DNS_TTL_AT_EXIT;
   else
-    return ttl;
-}
-
-/** Helper: Given a TTL from a DNS response, determine how long to hold it in
- * our cache. */
-STATIC uint32_t
-dns_get_expiry_ttl(uint32_t ttl)
-{
-  if (ttl < MIN_DNS_TTL)
-    return MIN_DNS_TTL;
-  else if (ttl > MAX_DNS_ENTRY_AGE)
-    return MAX_DNS_ENTRY_AGE;
-  else
-    return ttl;
+    return MAX_DNS_TTL_AT_EXIT;
 }
 
 /** Helper: free storage held by an entry in the DNS cache. */
@@ -353,7 +326,7 @@ cached_resolve_add_answer(cached_resolve_t *resolve,
       resolve->result_ipv4.err_ipv4 = dns_result;
       resolve->res_status_ipv4 = RES_STATUS_DONE_ERR;
     }
-
+    resolve->ttl_ipv4 = ttl;
   } else if (query_type == DNS_IPv6_AAAA) {
     if (resolve->res_status_ipv6 != RES_STATUS_INFLIGHT)
       return;
@@ -368,6 +341,7 @@ cached_resolve_add_answer(cached_resolve_t *resolve,
       resolve->result_ipv6.err_ipv6 = dns_result;
       resolve->res_status_ipv6 = RES_STATUS_DONE_ERR;
     }
+    resolve->ttl_ipv6 = ttl;
   }
 }
 
@@ -548,6 +522,7 @@ send_resolved_cell,(edge_connection_t *conn, uint8_t answer_type,
         answer_type = RESOLVED_TYPE_ERROR;
         /* fall through. */
       }
+      /* Falls through. */
     case RESOLVED_TYPE_ERROR_TRANSIENT:
     case RESOLVED_TYPE_ERROR:
       {
@@ -846,8 +821,14 @@ dns_resolve_impl,(edge_connection_t *exitconn, int is_resolve,
 }
 
 /** Given an exit connection <b>exitconn</b>, and a cached_resolve_t
- * <b>resolve</b> whose DNS lookups have all succeeded or failed, update the
- * appropriate fields (address_ttl and addr) of <b>exitconn</b>.
+ * <b>resolve</b> whose DNS lookups have all either succeeded or failed,
+ * update the appropriate fields (address_ttl and addr) of <b>exitconn</b>.
+ *
+ * The logic can be complicated here, since we might have launched both
+ * an A lookup and an AAAA lookup, and since either of those might have
+ * succeeded or failed, and since we want to answer a RESOLVE cell with
+ * a full answer but answer a BEGIN cell with whatever answer the client
+ * would accept <i>and</i> we could still connect to.
  *
  * If this is a reverse lookup, set *<b>hostname_out</b> to a newly allocated
  * copy of the name resulting hostname.
@@ -1190,7 +1171,12 @@ dns_found_answer(const char *address, uint8_t query_type,
 
 /** Given a pending cached_resolve_t that we just finished resolving,
  * inform every connection that was waiting for the outcome of that
- * resolution. */
+ * resolution.
+ *
+ * Do this by sending a RELAY_RESOLVED cell (if the pending stream had sent us
+ * RELAY_RESOLVE cell), or by launching an exit connection (if the pending
+ * stream had send us a RELAY_BEGIN cell).
+ */
 static void
 inform_pending_connections(cached_resolve_t *resolve)
 {
@@ -1323,7 +1309,7 @@ make_pending_resolve_cached(cached_resolve_t *resolve)
         resolve->ttl_hostname < ttl)
       ttl = resolve->ttl_hostname;
 
-    set_expiry(new_resolve, time(NULL) + dns_get_expiry_ttl(ttl));
+    set_expiry(new_resolve, time(NULL) + dns_clip_ttl(ttl));
   }
 
   assert_cache_ok();
@@ -1372,23 +1358,6 @@ configure_nameservers(int force)
       return -1;
     }
   }
-
-#ifdef HAVE_EVDNS_SET_DEFAULT_OUTGOING_BIND_ADDRESS
-  if (! tor_addr_is_null(&options->OutboundBindAddressIPv4_)) {
-    int socklen;
-    struct sockaddr_storage ss;
-    socklen = tor_addr_to_sockaddr(&options->OutboundBindAddressIPv4_, 0,
-                                   (struct sockaddr *)&ss, sizeof(ss));
-    if (socklen <= 0) {
-      log_warn(LD_BUG, "Couldn't convert outbound bind address to sockaddr."
-               " Ignoring.");
-    } else {
-      evdns_base_set_default_outgoing_bind_address(the_evdns_base,
-                                                   (struct sockaddr *)&ss,
-                                                   socklen);
-    }
-  }
-#endif
 
   evdns_set_log_fn(evdns_log_cb);
   if (conf_fname) {
@@ -1454,15 +1423,32 @@ configure_nameservers(int force)
   }
 #endif
 
-#define SET(k,v)  evdns_base_set_option_(the_evdns_base, (k), (v))
+#define SET(k,v)  evdns_base_set_option(the_evdns_base, (k), (v))
 
+  // If we only have one nameserver, it does not make sense to back off
+  // from it for a timeout. Unfortunately, the value for max-timeouts is
+  // currently clamped by libevent to 255, but it does not hurt to set
+  // it higher in case libevent gets a patch for this.
+  // Reducing attempts in the case of just one name server too, because
+  // it is very likely to be a local one where a network connectivity
+  // issue should not cause an attempt to fail.
   if (evdns_base_count_nameservers(the_evdns_base) == 1) {
-    SET("max-timeouts:", "16");
-    SET("timeout:", "10");
+    SET("max-timeouts:", "1000000");
+    SET("attempts:", "1");
   } else {
     SET("max-timeouts:", "3");
-    SET("timeout:", "5");
   }
+
+  // Elongate the queue of maximum inflight dns requests, so if a bunch
+  // time out at the resolver (happens commonly with unbound) we won't
+  // stall every other DNS request. This potentially means some wasted
+  // CPU as there's a walk over a linear queue involved, but this is a
+  // much better tradeoff compared to just failing DNS requests because
+  // of a full queue.
+  SET("max-inflight:", "8192");
+
+  // Time out after 5 seconds if no reply.
+  SET("timeout:", "5");
 
   if (options->ServerDNSRandomizeCase)
     SET("randomize-case:", "1");

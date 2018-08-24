@@ -60,7 +60,7 @@
 time_t startup_time = 0;
 
 struct runtime_vars_s runtime_vars;
-uint32_t runtime_flags = INOTIFY_MASK;
+uint32_t runtime_flags = INOTIFY_MASK | TIVO_BONJOUR_MASK;
 
 const char *pidfilename = "/var/run/minidlna/minidlna.pid";
 
@@ -84,7 +84,6 @@ const char * minissdpdsocketpath = "/var/run/minissdpd.sock";
 sqlite3 *db;
 char friendly_name[FRIENDLYNAME_MAX_LEN];
 char db_path[PATH_MAX] = {'\0'};
-char db_path_spec[PATH_MAX] = {'\0'};
 char log_path[PATH_MAX] = {'\0'};
 struct media_dir_s * media_dirs = NULL;
 struct album_art_name_s * album_art_names = NULL;
@@ -93,3 +92,4 @@ volatile short int quitting = 0;
 volatile uint32_t updateID = 0;
 const char *force_sort_criteria = NULL;
 short int rescan_db = 0;
+int web_status = 0;
